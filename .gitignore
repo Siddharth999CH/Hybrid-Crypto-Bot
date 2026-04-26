@@ -1,0 +1,15 @@
+# Environments
+bot_env/
+.env
+
+# Database
+*.db
+*.sqlite3
+
+# Python Caches
+__pycache__/
+*.pyc
+
+# IDE/OS files
+.vscode/
+.DS_Store
