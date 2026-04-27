@@ -34,7 +34,7 @@ function NumInput({ value, onChange, min, max, step = 1, suffix = '' }) {
     <div className="flex items-center gap-1.5">
       <input
         type="number" min={min} max={max} step={step}
-        value={value}
+        value={value || ''}
         onChange={e => onChange(parseFloat(e.target.value) || 0)}
         className="w-20 bg-gray-900 border border-gray-700 rounded px-2 py-1 text-sm text-gray-200 text-right focus:outline-none focus:border-emerald-500/50"
       />
@@ -47,7 +47,14 @@ function NumInput({ value, onChange, min, max, step = 1, suffix = '' }) {
 
 function RiskTab({ s, save }) {
   const [local, setLocal] = useState(s);
-  useEffect(() => setLocal(s), [s]);
+  
+  // Only initialize once to prevent overwriting user input while typing
+  useEffect(() => {
+    if (Object.keys(local).length === 0 && Object.keys(s).length > 0) {
+      setLocal(s);
+    }
+  }, [s]);
+
   const upd = k => v => setLocal(p => ({ ...p, [k]: v }));
 
   return (
@@ -80,12 +87,40 @@ function RiskTab({ s, save }) {
 }
 
 // ─── THE NEW AI-AGNOSTIC BOT TAB ───────────────────────────────────────────
-function BotTab({ s, save }) {
+function BotTab({ s, save, showToast }) {
   const [local, setLocal] = useState(s);
-  useEffect(() => setLocal(s), [s]);
+  
+  // Only initialize once to prevent overwriting text inputs when a toggle is clicked
+  useEffect(() => {
+    if (Object.keys(local).length === 0 && Object.keys(s).length > 0) {
+      setLocal(s);
+    }
+  }, [s]);
   
   const upd = k => v => { setLocal(p => ({ ...p, [k]: v })); save({ [k]: v }); };
   const updText = k => e => setLocal(p => ({ ...p, [k]: e.target.value }));
+
+  // Add Validation Guard Here
+  const handleSaveAI = () => {
+    const provider = local.llm_provider || 'anthropic';
+    const modelName = local.llm_model_name?.trim() || '';
+    const apiKey = local.llm_api_key?.trim() || '';
+
+    if (!modelName) {
+      return showToast('Please enter a Model Name (e.g., gpt-4o-mini).', 'danger');
+    }
+    
+    // Require API key unless the user selected Ollama
+    if (provider !== 'ollama' && !apiKey) {
+      return showToast(`An API Key is required for ${provider}.`, 'danger');
+    }
+
+    save({ 
+      llm_provider: provider, 
+      llm_model_name: modelName, 
+      llm_api_key: apiKey 
+    });
+  };
 
   return (
     <div className="space-y-4">
@@ -117,11 +152,7 @@ function BotTab({ s, save }) {
 
         <div className="pt-2">
           <button 
-            onClick={() => save({ 
-              llm_provider: local.llm_provider, 
-              llm_model_name: local.llm_model_name, 
-              llm_api_key: local.llm_api_key 
-            })} 
+            onClick={handleSaveAI} 
             className="text-xs px-4 py-2 bg-purple-500/10 border border-purple-500/30 rounded text-purple-400 hover:bg-purple-500/20 transition w-full"
           >
             Save AI Settings
@@ -131,17 +162,27 @@ function BotTab({ s, save }) {
 
       {/* Standard Bot Behavior */}
       <div className="space-y-1 pt-2">
+        <Row label="Trading Style (Phase B)" desc="Sets the Aggregator speed and Quant calculation targets">
+          <select 
+            value={local.trading_style || 'scalp'} 
+            onChange={(e) => upd('trading_style')(e.target.value)}
+            className="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-sm text-gray-200 focus:outline-none focus:border-emerald-500/50"
+          >
+            <option value="scalp">Scalp (15m Cycle)</option>
+            <option value="swing">Swing (4h Cycle)</option>
+          </select>
+        </Row>
         <Row label="Paper trading mode" desc="Simulate trades — no real orders placed">
-          <Toggle value={local.paper_mode} onChange={upd('paper_mode')} />
+          <Toggle value={local.paper_mode || false} onChange={upd('paper_mode')} />
         </Row>
         <Row label="AI mock mode" desc="Use simulated scores without calling API (no cost)">
-          <Toggle value={local.ai_mock_mode} onChange={upd('ai_mock_mode')} />
+          <Toggle value={local.ai_mock_mode || false} onChange={upd('ai_mock_mode')} />
         </Row>
         <Row label="Signal notifications" desc="Log every signal seen, even rejected ones">
-          <Toggle value={local.signal_notifications} onChange={upd('signal_notifications')} />
+          <Toggle value={local.signal_notifications || false} onChange={upd('signal_notifications')} />
         </Row>
         <Row label="Trailing stop loss" desc="Move SL to breakeven after TP1 is hit">
-          <Toggle value={local.trailing_sl} onChange={upd('trailing_sl')} />
+          <Toggle value={local.trailing_sl || false} onChange={upd('trailing_sl')} />
         </Row>
       </div>
     </div>
@@ -342,8 +383,8 @@ function ExchangeTab({ showToast }) {
       <div className="bg-gray-900/50 border border-gray-800 rounded-xl p-4 flex items-center gap-3">
         <div className={`w-2 h-2 rounded-full ${settings.binance_connected ? 'bg-emerald-400 animate-pulse' : 'bg-gray-600'}`} />
         <div className="flex-1">
-          <div className="text-sm text-gray-200">Binance {settings.BINANCE_TESTNET ? 'Testnet' : 'Live'}</div>
-          <div className="text-[11px] text-gray-600 mt-0.5">{settings.binance_connected ? 'API keys loaded from .env' : 'No API keys configured'}</div>
+          <div className="text-sm text-gray-200">Binance Setup</div>
+          <div className="text-[11px] text-gray-600 mt-0.5">{settings.binance_connected ? 'API keys successfully loaded from .env' : 'No API keys configured'}</div>
         </div>
         <span className={`text-[10px] px-2 py-0.5 rounded border ${settings.binance_connected ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-400' : 'border-gray-700 text-gray-600'}`}>
           {settings.binance_connected ? 'Connected' : 'Not configured'}
@@ -351,13 +392,12 @@ function ExchangeTab({ showToast }) {
       </div>
 
       <div className="bg-[#0D0E12] border border-gray-800 rounded-xl p-5 space-y-4">
-        <div className="text-xs text-gray-400 uppercase tracking-wider">How to set up Binance Testnet</div>
+        <div className="text-xs text-gray-400 uppercase tracking-wider">How to set up Binance API</div>
         {[
-          ['1', 'Go to testnet.binancefuture.com'],
-          ['2', 'Log in and generate API keys'],
+          ['1', 'Go to Binance API Management'],
+          ['2', 'Generate API keys with "Enable Futures" permissions'],
           ['3', 'Add BINANCE_API_KEY and BINANCE_SECRET to your .env file'],
-          ['4', 'Set BINANCE_TESTNET=true in your .env (already default)'],
-          ['5', 'Restart the backend — balance will load automatically'],
+          ['4', 'Restart the backend — balance will load automatically'],
         ].map(([n, txt]) => (
           <div key={n} className="flex items-start gap-3 text-xs text-gray-500">
             <span className="w-5 h-5 rounded-full bg-gray-800 border border-gray-700 text-gray-600 text-[10px] flex items-center justify-center flex-shrink-0">{n}</span>
@@ -369,8 +409,7 @@ function ExchangeTab({ showToast }) {
       <div className="bg-[#0D0E12] border border-gray-800 rounded-xl p-4 space-y-2">
         <div className="text-xs text-gray-400 uppercase tracking-wider mb-3">env file reference</div>
         <pre className="text-[11px] text-gray-500 leading-relaxed font-mono bg-gray-900/50 rounded p-3 overflow-x-auto">{`BINANCE_API_KEY=your_key_here
-BINANCE_SECRET=your_secret_here
-BINANCE_TESTNET=true`}</pre>
+BINANCE_SECRET=your_secret_here`}</pre>
       </div>
     </div>
   );
@@ -433,7 +472,7 @@ export default function Settings({ showToast }) {
 
       <div className="bg-[#0D0E12] border border-gray-800 rounded-xl p-5">
         {tab === 'risk'     && <RiskTab s={settings} save={save} />}
-        {tab === 'bot'      && <BotTab s={settings} save={save} />}
+        {tab === 'bot'      && <BotTab s={settings} save={save} showToast={showToast} />}
         {tab === 'telegram' && <TelegramTab showToast={showToast} />}
         {tab === 'exchange' && <ExchangeTab showToast={showToast} />}
         {tab === 'team'     && <TeamTab />}

@@ -21,6 +21,8 @@ ccxt==4.1.45
 
 # AI
 anthropic==0.7.7
+litellm
+certifi
 
 # Auth
 passlib[bcrypt]==1.7.4

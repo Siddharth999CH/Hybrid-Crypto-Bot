@@ -32,11 +32,12 @@ export default function Ingestion({ showToast }) {
     }
   };
 
-  const deleteSource = async (id) => {
+  const deleteSource = async (id, sourceType) => {
     try {
-      await api.delete(`/api/channels/${id}`);
+      const q = sourceType ? `?source_type=${sourceType}` : '';
+      await api.delete(`/api/channels/${id}${q}`);
       showToast("🗑️ Data source removed", "info");
-      setSources(prev => prev.filter(s => s.id !== id));
+      setSources(prev => prev.filter(s => !(s.id === id && s.source_type === sourceType)));
     } catch (err) {
       showToast("❌ Failed to remove data source", "danger");
     }
@@ -115,7 +116,7 @@ export default function Ingestion({ showToast }) {
             sources.map(source => {
               const isApi = source.username.startsWith('http');
               return (
-                <div key={source.id} className="flex items-center justify-between p-5 hover:bg-white/[0.02] transition-colors group">
+                <div key={`${source.source_type || 'telegram'}-${source.id}`} className="flex items-center justify-between p-5 hover:bg-white/[0.02] transition-colors group">
                   <div className="flex items-center gap-4">
                     <div className="p-2 bg-gray-900 rounded-lg border border-gray-800 group-hover:border-blue-500/30 transition-colors">
                       {isApi ? <Globe className="text-blue-400" size={20}/> : <MessageSquare className="text-emerald-400" size={20}/>}
@@ -133,7 +134,7 @@ export default function Ingestion({ showToast }) {
                       </p>
                     </div>
                   </div>
-                  <button onClick={() => deleteSource(source.id)} className="text-gray-600 hover:text-red-400 hover:bg-red-500/10 p-2 rounded-lg transition-all border border-transparent hover:border-red-500/30">
+                  <button onClick={() => deleteSource(source.id, source.source_type)} className="text-gray-600 hover:text-red-400 hover:bg-red-500/10 p-2 rounded-lg transition-all border border-transparent hover:border-red-500/30">
                     <Trash2 size={18} />
                   </button>
                 </div>

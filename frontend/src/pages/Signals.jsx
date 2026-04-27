@@ -38,7 +38,7 @@ export default function Signals({ pendingApprovals, setPendingApprovals, showToa
             <div key={sig.signal_id} className="bg-[#0D0E12] border border-gray-800 rounded-xl p-5 flex items-center justify-between transition-all hover:border-gray-700">
               <div className="flex-1 mr-6">
                 <div className="flex items-center gap-3 mb-1">
-                  <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${sig.direction === 'BUY' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-red-500/20 text-red-400'}`}>
+                  <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${sig.direction === 'BUY' || sig.direction === 'LONG' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-red-500/20 text-red-400'}`}>
                     {sig.direction}
                   </span>
                   <span className="text-lg font-bold text-white">{sig.coin}/USDT</span>

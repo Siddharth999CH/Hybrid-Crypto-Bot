@@ -1,193 +1,246 @@
 import json
 import random
-from typing import Optional
+import re
+from typing import Optional, List
+from datetime import datetime, timezone
 from sqlalchemy import select
-import litellm
-from litellm import acompletion
+import ccxt.async_support as ccxt 
 
-from signal_parser import ParsedSignal
 from config import settings
 from state import bot_state
 from database import AsyncSessionLocal, MarketContext
 
-def calculate_rr_ratio(signal: ParsedSignal) -> Optional[float]:
-    """Risk:Reward ratio. Higher = better signal."""
-    if not signal.entry_price or not signal.stop_loss or not signal.tp1:
-        return None
-    risk = abs(signal.entry_price - signal.stop_loss)
-    reward = abs(signal.tp1 - signal.entry_price)
-    if risk == 0:
-        return None
-    return round(reward / risk, 2)
+# ─────────────────────────────────────────
+# GLOBAL INSTANCES (Bug 2 Fix)
+# ─────────────────────────────────────────
+# Keeps the socket open so Binance doesn't rate-limit or IP ban us.
+binance_client = ccxt.binance({'enableRateLimit': True})
 
+# ─────────────────────────────────────────
+# 1. MATHEMATICAL & SIZING HELPERS
+# ─────────────────────────────────────────
+def calculate_trade_parameters(
+    current_price: float, 
+    direction: str, 
+    trading_style: str
+) -> dict:
+    """Calculates TP and SL based on the current trading style."""
+    
+    if trading_style == "scalp":
+        tp_pct = 0.02  # 2% target
+        sl_pct = 0.01  # 1% stop
+    elif trading_style == "swing":
+        tp_pct = 0.10  # 10% target
+        sl_pct = 0.05  # 5% stop
+    else:
+        # Fallback defaults
+        tp_pct = 0.05
+        sl_pct = 0.02
+
+    if direction == "LONG":
+        tp = current_price * (1 + tp_pct)
+        sl = current_price * (1 - sl_pct)
+    else: # SHORT
+        tp = current_price * (1 - tp_pct)
+        sl = current_price * (1 + sl_pct)
+        
+    return {
+        "entry_price": round(current_price, 4),
+        "tp1": round(tp, 4),
+        "stop_loss": round(sl, 4)
+    }
 
 def calculate_position_size(
-    signal: ParsedSignal,
+    entry_price: float,
+    stop_loss: float,
     portfolio_balance: float,
-    confidence: float
+    confidence: float,
+    leverage: int = 1
 ) -> float:
-    """
-    AI-driven position sizing:
-    - Base risk = 1% of portfolio (hard cap)
-    - Adjusted by confidence score (0.5 confidence = 50% of base risk)
-    - Never exceeds max_risk_pct regardless of confidence
-    """
-    if not signal.entry_price or not signal.stop_loss:
-        # Fallback: use 0.5% of portfolio
-        return round(portfolio_balance * 0.005, 2)
-
+    """Calculates position size strictly respecting max risk and confidence."""
     max_risk_usdt = portfolio_balance * (bot_state.max_risk_pct / 100)
-
-    # Scale by confidence: confidence 0.5 -> 50% of max, 1.0 -> 100% of max
+    
+    # Scale risk linearly by confidence
     confidence_factor = min(max(confidence, 0.0), 1.0)
     adjusted_risk = max_risk_usdt * confidence_factor
 
-    # Calculate position size from risk amount
-    risk_per_unit = abs(signal.entry_price - signal.stop_loss)
+    risk_per_unit = abs(entry_price - stop_loss)
     if risk_per_unit == 0:
         return round(adjusted_risk, 2)
 
     units = adjusted_risk / risk_per_unit
-    position_size = units * signal.entry_price
+    position_size = units * entry_price * leverage
 
-    # Apply leverage factor for futures
-    leverage = signal.leverage or 1
-    position_size = position_size * leverage
-
-    # Hard cap at 10% of portfolio regardless of leverage/confidence
+    # Hard cap at 10% of portfolio to prevent massive exposure
     max_position = portfolio_balance * 0.10
     return round(min(position_size, max_position), 2)
 
 
-async def score_signal(signal: ParsedSignal, channel_trust: float = 0.5) -> float:
-    """
-    Score a signal 0.0 - 1.0.
-    Combines: R:R ratio, completeness, channel trust, and LIVE DEX CONFLUENCE.
-    """
-    # 1. Check if we should bypass the API
-    if bot_state.ai_mock_mode or not settings.LLM_API_KEY:
-        if not settings.LLM_API_KEY and not bot_state.ai_mock_mode:
-            bot_state.log("⚠️ No LLM_API_KEY provided. Falling back to mock scores.", level="warning")
-        return _mock_score(signal, channel_trust)
+# ─────────────────────────────────────────
+# 2. DATA INGESTION HELPERS
+# ─────────────────────────────────────────
+async def fetch_live_price(coin: str) -> Optional[float]:
+    """Fetches the live ticker price from Binance via CCXT."""
+    try:
+        # Re-using the global binance_client instance
+        ticker = await binance_client.fetch_ticker(f"{coin}/USDT")
+        return float(ticker['last'])
+    except Exception as e:
+        bot_state.log(f"⚠️ Failed to fetch live price for {coin}: {e}", level="warning")
+        if bot_state.ai_mock_mode:
+            # Testing-mode fallback so the full pipeline remains usable offline.
+            return 100.0
+        return None
 
-    # 2. GATE 3: THE CONFLUENCE ENGINE (Fetch from Memory)
+async def fetch_dex_context(coin: str) -> str:
+    """Pulls the latest quantitative Hyperliquid data from local DB."""
     dex_context = "No live DEX data available for this coin."
     try:
-        if signal.coin:
-            async with AsyncSessionLocal() as db:
-                stmt = select(MarketContext).where(
-                    MarketContext.coin == signal.coin.upper(),
-                    MarketContext.data_type == "DEX_Metrics"
-                )
-                result = await db.execute(stmt)
-                db_record = result.scalar_one_or_none()
-                
-                if db_record and db_record.payload:
-                    payload = db_record.payload
-                    funding = payload.get("funding_rate", "N/A")
-                    oi = payload.get("open_interest", "N/A")
-                    pred_funding = payload.get("predicted_funding", "N/A")
-                    dex_context = f"Funding Rate: {funding} | Open Interest: ${oi} | Predicted Funding (8h): {pred_funding}"
+        async with AsyncSessionLocal() as db:
+            stmt = select(MarketContext).where(
+                MarketContext.coin == coin.upper(),
+                MarketContext.data_type == "DEX_Metrics"
+            )
+            result = await db.execute(stmt)
+            db_record = result.scalar_one_or_none()
+            
+            if db_record and db_record.payload:
+                payload = db_record.payload
+                funding = payload.get("funding_rate", "N/A")
+                oi = payload.get("open_interest", "N/A")
+                dex_context = f"Funding Rate: {funding} | Open Interest: ${oi}"
     except Exception as e:
         bot_state.log(f"⚠️ Failed to read MarketContext: {e}", level="warning")
+        
+    return dex_context
 
-    # 3. THE LLM EVALUATION (Now LLM-Agnostic via LiteLLM)
-    try:
-        signal_summary = f"""
-Coin: {signal.coin}
-Direction: {signal.direction}
-Entry: {signal.entry_price}
-TP1: {signal.tp1}, TP2: {signal.tp2}, TP3: {signal.tp3}
-Stop Loss: {signal.stop_loss}
-Leverage: {signal.leverage or 'none'}
-Market: {signal.market_type}
-Channel trust: {channel_trust}
-Raw message: {signal.raw_text[:300]}
 
---- LIVE HYPERLIQUID DEX CONFLUENCE ---
+# ─────────────────────────────────────────
+# 3. THE GENERATIVE AI ENGINE
+# ─────────────────────────────────────────
+async def evaluate_sentiment_bias(
+    coin: str, 
+    messages: List[str], 
+    dex_context: str
+) -> dict:
+    """Uses LLM to evaluate social heat vs DEX reality and output a directional bias."""
+    
+    if bot_state.ai_mock_mode or not settings.LLM_API_KEY:
+        bot_state.log("⚠️ LLM bypassed. Using mock generation.", level="warning")
+        return {"bias": random.choice(["LONG", "SHORT"]), "confidence": 0.75, "reason": "Mock mode active."}
+
+    # Compress messages to avoid blowing up context windows
+    compressed_messages = " | ".join(messages)[:1500]
+
+    prompt = f"""You are an elite quantitative crypto analyst. Your job is to determine a trading bias (LONG, SHORT, or NEUTRAL) based on recent social sentiment and live market data.
+
+Target Asset: {coin}
+Current Trading Style: {bot_state.trading_style.upper()}
+
+--- SOCIAL SENTIMENT INTERCEPTS ---
+{compressed_messages}
+
+--- LIVE DEX CONFLUENCE (Hyperliquid) ---
 {dex_context}
+
+Analysis Rules:
+1. Compare the sentiment against the DEX data. If social is hyper-bullish but Funding Rates are heavily positive (longs paying shorts), that is a bearish divergence.
+2. If the data conflicts heavily, output NEUTRAL.
+3. If there is a strong alignment between social heat and market structure, assign a high confidence score.
+
+Return ONLY a JSON exactly like this: 
+{{"bias": "LONG", "confidence": 0.85, "reason": "Social sentiment indicates a breakout, supported by negative funding rates (shorts squeezed)."}}
 """
 
-        prompt = f"""You are a quant risk analyst evaluating a crypto trading signal. Score this from 0.0 to 1.0.
-
-{signal_summary}
-
-Scoring criteria:
-- R:R ratio (higher is better, 1:2+ is good)
-- Signal completeness (has entry, TP, SL = higher score)
-- Channel trust weight (0.0 to 1.0)
-- MARKET CONFLUENCE: Does the DEX data support the trade? 
-  * If LONG: High negative funding means shorts are paying longs (Bullish structure). Drop score if OI is extremely low.
-  * If SHORT: High positive funding means longs are paying shorts (Bearish structure).
-  * If no DEX data is available, do not penalize heavily, base it on the R:R.
-
-Return ONLY a JSON exactly like this: {{"confidence": 0.82, "reason": "Good R:R of 2.1, but lowered score slightly due to conflicting DEX funding rates."}}"""
-
-        # LiteLLM dynamically routes this based on the model string
+    try:
+        # Lazy import keeps backend bootable when optional AI deps are missing.
+        from litellm import acompletion
         response = await acompletion(
             model=settings.LLM_MODEL_NAME,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=150,
+            max_tokens=200,
             temperature=0.1,
             api_key=settings.LLM_API_KEY
         )
         
-        # Extract the JSON from the agnostic response format
         raw_text = response.choices[0].message.content.strip()
         
-        # Strip markdown codeblocks if the LLM adds them
-        if raw_text.startswith("```json"):
-            raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+        # Bug 3 Fix: Regex parsing to guarantee JSON extraction
+        json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+        if json_match:
+            data = json.loads(json_match.group(0))
+        else:
+            raise ValueError("No valid JSON object found in LLM response.")
             
-        data = json.loads(raw_text)
+        bot_state.log(f"🧠 AI Quant [{settings.LLM_MODEL_NAME}]: {coin} {data.get('bias')} - {data.get('reason', '')[:100]}...")
         
-        bot_state.log(f"🧠 AI Reasoning [{settings.LLM_MODEL_NAME}]: {data.get('reason', 'None')}")
-        
-        return float(data.get("confidence", 0.5))
+        return {
+            "bias": data.get("bias", "NEUTRAL").upper(),
+            "confidence": float(data.get("confidence", 0.0)),
+            "reason": data.get("reason", "No reason provided.")
+        }
 
     except Exception as e:
-        bot_state.log(f"⚠️ AI scoring error: {str(e)[:50]}", level="warning")
-        return _mock_score(signal, channel_trust)
+        bot_state.log(f"⚠️ AI generation error: {str(e)[:50]}", level="warning")
+        return {"bias": "NEUTRAL", "confidence": 0.0, "reason": "LLM Failure"}
 
 
-def _mock_score(signal: ParsedSignal, channel_trust: float) -> float:
-    """Deterministic mock scoring without API calls."""
-    score = 0.0
+# ─────────────────────────────────────────
+# 4. MAIN ORCHESTRATOR (Handoff from Phase A)
+# ─────────────────────────────────────────
+async def analyze_sentiment_target(coin: str, raw_messages: List[str], portfolio_balance: float) -> Optional[dict]:
+    """
+    Full Phase B Pipeline: 
+    Takes raw sentiment -> Fetches Data -> Generates Bias -> Calculates Math -> Returns Trade Dict
+    """
+    bot_state.log(f"🔍 Phase B: Analyzing aggregated sentiment for {coin}...")
 
-    # Completeness
-    if signal.coin: score += 0.15
-    if signal.entry_price: score += 0.15
-    if signal.tp1: score += 0.15
-    if signal.stop_loss: score += 0.20
+    # 1. Fetch Market Reality
+    current_price = await fetch_live_price(coin)
+    if not current_price:
+        bot_state.log(f"❌ Aborting analysis for {coin}: Could not fetch live price.")
+        return None
 
-    # R:R ratio
-    rr = calculate_rr_ratio(signal)
-    if rr:
-        if rr >= 2.0: score += 0.20
-        elif rr >= 1.5: score += 0.12
-        elif rr >= 1.0: score += 0.06
+    dex_context = await fetch_dex_context(coin)
 
-    # Channel trust
-    score += channel_trust * 0.15
+    # 2. Get LLM Bias & Confidence
+    ai_decision = await evaluate_sentiment_bias(coin, raw_messages, dex_context)
+    
+    if ai_decision["bias"] == "NEUTRAL" or ai_decision["confidence"] < 0.50:
+        bot_state.log(f"⏭️ Skipping {coin}: AI confidence too low or bias neutral.")
+        return None
 
-    # Add small random variation to make it feel realistic
-    score += random.uniform(-0.03, 0.03)
+    # 3. Calculate Mathematical Trade Targets based on Trading Style
+    params = calculate_trade_parameters(
+        current_price=current_price,
+        direction=ai_decision["bias"],
+        trading_style=bot_state.trading_style
+    )
 
-    return round(min(max(score, 0.0), 1.0), 2)
+    # 4. Calculate Risk-Adjusted Position Size
+    position_size = calculate_position_size(
+        entry_price=params["entry_price"],
+        stop_loss=params["stop_loss"],
+        portfolio_balance=portfolio_balance,
+        confidence=ai_decision["confidence"],
+        leverage=settings.MAX_LEVERAGE
+    )
 
-
-async def analyze_signal(signal: ParsedSignal, channel_trust: float, portfolio_balance: float) -> dict:
-    """Full analysis pipeline. Returns enriched signal dict ready for approval."""
-    confidence = await score_signal(signal, channel_trust)
-    signal.confidence = confidence
-
-    rr = calculate_rr_ratio(signal)
-    position_size = calculate_position_size(signal, portfolio_balance, confidence)
-
-    return {
-        **signal.to_dict(),
-        "confidence": confidence,
-        "rr_ratio": rr,
+    # 5. Format payload for bot_state.pending_approvals queue
+    trade_payload = {
+        "coin": coin,
+        "direction": ai_decision["bias"],
+        "entry_price": params["entry_price"],
+        "tp1": params["tp1"],
+        "stop_loss": params["stop_loss"],
         "position_size_usdt": position_size,
-        "channel_trust": channel_trust,
+        "confidence": ai_decision["confidence"],
+        "reason": ai_decision["reason"],
+        "trading_style": bot_state.trading_style,
+        "market_type": "futures",
+        "leverage": settings.MAX_LEVERAGE,
+        "timestamp": datetime.now(timezone.utc).isoformat() # Bug 4 Fix: True Timestamp
     }
+
+    bot_state.log(f"🎯 Trade Drafted: {coin} {ai_decision['bias']} at {params['entry_price']} (Size: ${position_size})")
+    return trade_payload

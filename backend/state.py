@@ -1,6 +1,8 @@
 import asyncio
 from datetime import datetime, date
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
+import json
+import sys
 from config import settings
 
 class BotState:
@@ -25,7 +27,7 @@ class BotState:
         self.sl_cooldowns: Dict[str, datetime] = {}
 
         # Activity log (newest first)
-        self.activity_logs: List[str] = []
+        self.activity_logs: List[dict] = []
 
         # WebSocket connections
         self.ws_clients: List = []
@@ -41,13 +43,52 @@ class BotState:
         self.trailing_sl: bool = False
         self.signal_notifications: bool = True
 
+        # ─────────────────────────────────────────
+        # PHASE A: SENTIMENT RADAR VARIABLES
+        # ─────────────────────────────────────────
+        self.trading_style: str = "scalp" 
+        self.radar_bucket: Dict[str, dict] = {} 
+        self.active_trades_coins: Set[str] = set()
+    
+    def debug_log(self, run_id: str, hypothesis_id: str, location: str, message: str, data: dict):
+        try:
+            payload = {
+                "sessionId": "e3292d",
+                "runId": run_id,
+                "hypothesisId": hypothesis_id,
+                "location": location,
+                "message": message,
+                "data": data,
+                "timestamp": int(datetime.now().timestamp() * 1000),
+            }
+            with open("C:/Users/91990/Desktop/Hybrid-Crypto-Bot/debug-e3292d.log", "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+        except Exception:
+            pass
+
     def log(self, message: str, level: str = "info"):
         timestamp = datetime.now().strftime("%H:%M:%S")
         entry = {"time": timestamp, "message": message, "level": level}
         self.activity_logs.insert(0, entry)
         if len(self.activity_logs) > 50:
             self.activity_logs.pop()
-        print(f"[{timestamp}] {message}")
+        line = f"[{timestamp}] {message}"
+        try:
+            print(line)
+        except UnicodeEncodeError:
+            # Windows cp1252 consoles can choke on emoji; degrade gracefully.
+            encoding = (getattr(sys.stdout, "encoding", None) or "utf-8")
+            safe_line = line.encode(encoding, errors="replace").decode(encoding, errors="replace")
+            print(safe_line)
+        # #region agent log
+        self.debug_log(
+            run_id="initial",
+            hypothesis_id="H1",
+            location="backend/state.py:log",
+            message="bot_state.log emitted",
+            data={"level": level, "message": message[:200]},
+        )
+        # #endregion
 
     def check_and_reset_daily_pnl(self):
         today = str(date.today())
@@ -70,8 +111,26 @@ class BotState:
         """Returns (can_trade, reason_if_not)"""
         self.check_and_reset_daily_pnl()
         if self.kill_switch_active:
+            # #region agent log
+            self.debug_log(
+                run_id="initial",
+                hypothesis_id="H4",
+                location="backend/state.py:can_trade",
+                message="can_trade blocked by kill switch",
+                data={"coin": coin, "reason": self.kill_switch_reason},
+            )
+            # #endregion
             return False, f"Kill switch active: {self.kill_switch_reason}"
         if not self.is_active:
+            # #region agent log
+            self.debug_log(
+                run_id="initial",
+                hypothesis_id="H4",
+                location="backend/state.py:can_trade",
+                message="can_trade blocked by paused bot",
+                data={"coin": coin, "is_active": self.is_active},
+            )
+            # #endregion
             return False, "Bot is paused"
         if self.open_trades_count >= self.max_concurrent_trades:
             return False, f"Max concurrent trades ({self.max_concurrent_trades}) reached"
@@ -79,6 +138,29 @@ class BotState:
             if datetime.now() < self.sl_cooldowns[coin.upper()]:
                 remaining = (self.sl_cooldowns[coin.upper()] - datetime.now()).seconds // 60
                 return False, f"{coin} in SL cooldown ({remaining}m remaining)"
+        
+        # Phase A Check: Prevent opening multiple positions on the same coin
+        if coin.upper() in self.active_trades_coins:
+             # #region agent log
+             self.debug_log(
+                 run_id="initial",
+                 hypothesis_id="H4",
+                 location="backend/state.py:can_trade",
+                 message="can_trade blocked by active coin lock",
+                 data={"coin": coin},
+             )
+             # #endregion
+             return False, f"Trade already active for {coin}"
+             
+        # #region agent log
+        self.debug_log(
+            run_id="initial",
+            hypothesis_id="H4",
+            location="backend/state.py:can_trade",
+            message="can_trade allowed",
+            data={"coin": coin, "open_trades_count": self.open_trades_count},
+        )
+        # #endregion
         return True, ""
 
     def add_pnl(self, pnl_usdt: float):
@@ -102,7 +184,6 @@ class BotState:
                 dead.append(ws)
         for ws in dead:
             self.ws_clients.remove(ws)
-
 
 # Singleton
 bot_state = BotState()

@@ -1,3 +1,4 @@
+import re
 import asyncio
 from typing import Optional
 from telethon import TelegramClient, events
@@ -6,22 +7,65 @@ from config import settings
 from state import bot_state
 
 _client: Optional[TelegramClient] = None
-_signal_queue: Optional[asyncio.Queue] = None
 
-# Recent message hashes for dedup (last 30 min)
-_recent_signals: dict = {}  # coin+direction -> timestamp
+# Ignore non-asset words that often appear in signal text.
+IGNORE_LIST = {
+    "USDT", "USDC", "FDUSD", "DAI", "TUSD", "BUSD",
+    "LONG", "SHORT", "BUY", "SELL",
+    "THE", "AND", "FOR", "WITH", "THIS", "THAT", "FROM",
+    "STOP", "LOSS", "ENTRY", "MARKET", "SETUP", "SUPPORT",
+    "LEVERAGE", "VIP", "LOOKS", "PRIMED", "BOUNCE", "COIN", "OFF",
+}
 
-def _is_duplicate(coin: str, direction: str) -> bool:
-    import time
-    key = f"{coin}_{direction}"
-    now = time.time()
-    for k in list(_recent_signals.keys()):
-        if now - _recent_signals[k] > 1800:
-            del _recent_signals[k]
-    if key in _recent_signals:
-        return True
-    _recent_signals[key] = now
-    return False
+
+def extract_candidate_tickers(raw_text: str) -> set[str]:
+    """
+    Extract likely symbols from free-form messages.
+    Accept only stronger symbol patterns to avoid false positives.
+    """
+    text = (raw_text or "").upper()
+    tickers: set[str] = set()
+
+    # High-confidence patterns:
+    # - $BTC
+    # - BTC/USDT
+    # - BTCUSDT
+    for match in re.findall(r"\$([A-Z]{2,10})\b", text):
+        tickers.add(match)
+    for base in re.findall(r"\b([A-Z]{2,10})/USDT\b", text):
+        tickers.add(base)
+    for base in re.findall(r"\b([A-Z]{2,10})USDT\b", text):
+        tickers.add(base)
+
+    # Medium-confidence fallback:
+    # standalone short uppercase tokens like BTC, ETH, SOL, PEPE
+    for token in re.findall(r"\b[A-Z]{2,5}\b", text):
+        if token not in IGNORE_LIST:
+            tickers.add(token)
+
+    return tickers
+
+
+async def radar_flush_loop(signal_queue: asyncio.Queue):
+    """Periodically flushes Phase A bucket into Phase B queue."""
+    while True:
+        interval = 30 if bot_state.trading_style == "scalp" else 120
+        await asyncio.sleep(interval)
+        if not bot_state.is_active or bot_state.kill_switch_active:
+            continue
+        if not bot_state.radar_bucket:
+            continue
+
+        min_users = 1 if bot_state.ai_mock_mode else 2
+        # Require multiple unique users in normal mode; relax in testing mode.
+        for coin, bucket in list(bot_state.radar_bucket.items()):
+            user_count = len(bucket.get("users", set()))
+            if user_count < min_users:
+                continue
+            await signal_queue.put((coin, {"messages": list(bucket.get("messages", []))}))
+            bot_state.log(f"🧺 Flushed {coin} bucket -> pipeline ({user_count} users).")
+
+        bot_state.radar_bucket.clear()
 
 async def get_client() -> Optional[TelegramClient]:
     global _client
@@ -42,7 +86,6 @@ async def get_client() -> Optional[TelegramClient]:
         bot_state.log(f"❌ Telegram connection failed: {str(e)[:60]}", level="danger")
         return None
 
-# ─── Querying the new TelegramSource table instead of old Channel table ───
 async def get_active_channels(db) -> list:
     from sqlalchemy import select
     from database import TelegramSource 
@@ -50,101 +93,177 @@ async def get_active_channels(db) -> list:
     return result.scalars().all()
 
 async def start_scraper(signal_queue: asyncio.Queue, db_factory):
-    global _signal_queue
-    _signal_queue = signal_queue
-
+    # Note: signal_queue remains in the function signature to avoid breaking main.py
     client = await get_client()
     if not client:
         bot_state.log("⚠️ Scraper not started — no Telegram session.", level="warning")
+        # #region agent log
+        bot_state.debug_log(
+            run_id="initial",
+            hypothesis_id="H7",
+            location="backend/scraper.py:start_scraper",
+            message="scraper not started due missing client",
+            data={"has_session": bool(settings.TELEGRAM_SESSION_STRING), "has_api_id": bool(settings.TELEGRAM_API_ID)},
+        )
+        # #endregion
         return
 
-    # EMPTY BRACKETS = Listen to EVERYTHING (God Mode)
     @client.on(events.NewMessage())
     async def handler(event):
-        # 1. IMMEDIATE DIAGNOSTIC (Runs even if bot is paused)
-        try:
-            chat = await event.get_chat()
-            # Handle Private Chats (DMs) vs Groups/Channels
-            from telethon.tl.types import User
-            if isinstance(chat, User):
-                chat_title = f"{chat.first_name or ''} {chat.last_name or ''}".strip()
-                chat_username = chat.username or ""
-            else:
-                chat_title = getattr(chat, 'title', '') or ''
-                chat_username = getattr(chat, 'username', '') or ''
-                
-            print(f"🚨 ABSOLUTE RAW EVENT: Message from [{chat_title}] (@{chat_username})")
-        except Exception as e:
-            pass
-
-        # 2. STATE CHECK (Halts execution if paused, but AFTER logging)
-        if not bot_state.is_active:
+        if not bot_state.is_active or bot_state.kill_switch_active:
+            # #region agent log
+            bot_state.debug_log(
+                run_id="initial",
+                hypothesis_id="H7",
+                location="backend/scraper.py:handler",
+                message="incoming telegram message ignored due bot state",
+                data={"is_active": bot_state.is_active, "kill_switch_active": bot_state.kill_switch_active},
+            )
+            # #endregion
             return
 
-        # 3. Check watch list dynamically
+        try:
+            chat = await event.get_chat()
+            from telethon.tl.types import User
+            if isinstance(chat, User):
+                chat_username = chat.username or ""
+                chat_title = f"{chat.first_name or ''} {chat.last_name or ''}".strip()
+            else:
+                chat_username = getattr(chat, 'username', '') or ''
+                chat_title = getattr(chat, 'title', '') or ''
+        except Exception:
+            return
+
+        # Check watch list dynamically
         async with db_factory() as db:
             channels = await get_active_channels(db)
 
         if not channels:
-            return 
+            # #region agent log
+            bot_state.debug_log(
+                run_id="initial",
+                hypothesis_id="H7",
+                location="backend/scraper.py:handler",
+                message="incoming telegram message ignored due no active channels",
+                data={},
+            )
+            # #endregion
+            return
 
-        matched_channel = None
-        matched_trust = 0.5
-        
-        # SEARCH LOGIC: Check both Title and Username robustly
+        matched = False
         for ch in channels:
             ch_watch = (ch.username or "").lower().replace("@", "")
             ch_name = (ch.name or "").lower()
-            
-            # Match if watch-name is in the sender's username OR the sender's display name
             if (ch_watch and ch_watch in chat_username.lower()) or \
                (ch_name and ch_name in chat_title.lower()):
-                matched_channel = ch
-                matched_trust = ch.trust_weight
+                matched = True
                 break
 
-        if not matched_channel:
-            print(f"🚫 DEBUG: Ignored message from @{chat_username} (Not in Active Targets)")
+        if not matched:
+            # #region agent log
+            bot_state.debug_log(
+                run_id="initial",
+                hypothesis_id="H7",
+                location="backend/scraper.py:handler",
+                message="incoming telegram message did not match watchlist",
+                data={"chat_username": chat_username, "chat_title": chat_title, "active_channels": len(channels)},
+            )
+            # #endregion
             return 
 
         raw_text = event.text or ""
-        if len(raw_text.strip()) < 10:
-            return
+        if len(raw_text.strip()) < 5: return
 
-        source_name = chat_title or chat_username or "Unknown"
-        bot_state.log(f"📩 SUCCESS: Signal captured from [{source_name}]!")
+        sender = await event.get_sender()
+        user_id = sender.id if sender else 0
 
-        await signal_queue.put({
-            "text": raw_text,
-            "channel": source_name,
-            "channel_username": chat_username,
-            "trust": matched_trust
-        })
+        # --- PHASE A: RADAR TALLY LOGIC ---
+        found_tickers = extract_candidate_tickers(raw_text)
+        
+        for coin in found_tickers:
+            if coin in IGNORE_LIST:
+                continue
+            
+            if coin not in bot_state.radar_bucket:
+                bot_state.radar_bucket[coin] = {"users": set(), "messages": []}
+            
+            # Sybil Attack Fix: Only count unique users
+            if user_id not in bot_state.radar_bucket[coin]["users"]:
+                bot_state.radar_bucket[coin]["users"].add(user_id)
+                bot_state.radar_bucket[coin]["messages"].append(raw_text)
+                # #region agent log
+                bot_state.debug_log(
+                    run_id="initial",
+                    hypothesis_id="H6",
+                    location="backend/scraper.py:handler",
+                    message="radar bucket updated from telegram",
+                    data={
+                        "coin": coin,
+                        "unique_users": len(bot_state.radar_bucket[coin]["users"]),
+                        "messages": len(bot_state.radar_bucket[coin]["messages"]),
+                    },
+                )
+                # #endregion
 
-    bot_state.log("🔍 Telegram scraper listening (Dynamic Mode)...")
+    bot_state.log("🔍 NLP Radar listening (Sentiment Aggregation Mode)...")
     await client.run_until_disconnected()
 
-class SignalSimulator:
-    SAMPLE_SIGNALS = [
-        "🚀 BTC/USDT LONG\nEntry: 67,000\nTP1: 68,500\nSL: 65,800",
-        "SHORT ETH now! Target $3,200. Stop at $3,520.",
-        "SOL Buy Zone: 140-142\nTake Profit: 155\nStop Loss: 136",
+class RadarSimulator:
+    SAMPLE_MESSAGES = [
+        "SOL is looking super bullish right now.",
+        "I'm buying more SOL, breakout incoming!",
+        "ETH is lagging, moving funds to SOL.",
+        "BTC holding 65k nicely.",
+        "Anyone looking at WIF here?",
     ]
-    SAMPLE_CHANNELS = ["CryptoKings", "AltcoinAlerts"]
 
-    async def run(self, signal_queue: asyncio.Queue):
+    async def run(self):
         import random
-        bot_state.log("🤖 Signal simulator active.")
+        bot_state.log("🤖 Radar simulator active (Mocking Telegram Chatter).")
         while True:
-            await asyncio.sleep(random.uniform(15, 45))
+            await asyncio.sleep(random.uniform(5, 15))
             if not bot_state.is_active: continue
-            text = random.choice(self.SAMPLE_SIGNALS)
-            channel = random.choice(self.SAMPLE_CHANNELS)
-            await signal_queue.put({"text": text, "channel": channel, "trust": 0.8})
+            
+            text = random.choice(self.SAMPLE_MESSAGES)
+            user_id = random.randint(1000, 9999) # Fake unique user ID
+            
+            found_tickers = extract_candidate_tickers(text)
+            for coin in found_tickers:
+                if coin in IGNORE_LIST: continue
+                if coin not in bot_state.radar_bucket:
+                    bot_state.radar_bucket[coin] = {"users": set(), "messages": []}
+                
+                # Dump into bucket just like the real scraper
+                bot_state.radar_bucket[coin]["users"].add(user_id)
+                bot_state.radar_bucket[coin]["messages"].append(text)
+                # #region agent log
+                bot_state.debug_log(
+                    run_id="initial",
+                    hypothesis_id="H6",
+                    location="backend/scraper.py:RadarSimulator.run",
+                    message="radar bucket updated from simulator",
+                    data={
+                        "coin": coin,
+                        "unique_users": len(bot_state.radar_bucket[coin]["users"]),
+                        "messages": len(bot_state.radar_bucket[coin]["messages"]),
+                        "bot_active": bot_state.is_active,
+                    },
+                )
+                # #endregion
 
 async def start_signal_source(signal_queue: asyncio.Queue, db_factory):
+    asyncio.create_task(radar_flush_loop(signal_queue))
+    # #region agent log
+    bot_state.debug_log(
+        run_id="initial",
+        hypothesis_id="H7",
+        location="backend/scraper.py:start_signal_source",
+        message="signal source branch selected",
+        data={"using_telegram": bool(settings.TELEGRAM_SESSION_STRING and settings.TELEGRAM_API_ID)},
+    )
+    # #endregion
     if settings.TELEGRAM_SESSION_STRING and settings.TELEGRAM_API_ID:
         await start_scraper(signal_queue, db_factory)
     else:
-        sim = SignalSimulator()
-        await sim.run(signal_queue)
+        sim = RadarSimulator()
+        await sim.run()

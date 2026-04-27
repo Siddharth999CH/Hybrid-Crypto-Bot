@@ -97,8 +97,12 @@ export default function App() {
   useEffect(() => {
     fetchStatus();
     fetchApprovals();
-    const interval = setInterval(fetchStatus, 10000);
-    return () => clearInterval(interval);
+    const statusInterval = setInterval(fetchStatus, 10000);
+    const approvalsInterval = setInterval(fetchApprovals, 5000);
+    return () => {
+      clearInterval(statusInterval);
+      clearInterval(approvalsInterval);
+    };
   }, [fetchStatus, fetchApprovals]);
 
   const pageProps = { 

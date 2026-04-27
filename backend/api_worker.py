@@ -1,131 +1,165 @@
 import asyncio
-import httpx
-import json
-from datetime import datetime
+import aiohttp
+from datetime import datetime, timezone
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from database import AsyncSessionLocal, ApiSource, MarketContext
+from database import MarketContext, AsyncSessionLocal
 from state import bot_state
 
-# We use httpx for async HTTP requests
-async def fetch_api_data(client: httpx.AsyncClient, url: str):
-    """Fetches data from an API endpoint."""
+async def ingest_hyperliquid_meta(db: AsyncSession, session: aiohttp.ClientSession):
+    """Fetches Funding Rates and Open Interest for all coins on Hyperliquid."""
     try:
-        response = await client.get(url, timeout=10.0)
-        response.raise_for_status()
+        headers = {"Content-Type": "application/json"}
+        payload = {"type": "metaAndAssetCtxs"}
         
-        # Hyperliquid returns a list, CoinGecko returns a dict. 
-        # We need to handle both gracefully.
-        try:
-            return response.json()
-        except json.JSONDecodeError:
-            return {"raw_text": response.text}
+        async with session.post("https://api.hyperliquid.xyz/info", json=payload, headers=headers) as resp:
+            data = await resp.json()
             
-    except Exception as e:
-        print(f"❌ API Error fetching {url}: {e}")
-        return None
-
-async def ingest_hyperliquid_meta(db: AsyncSession):
-    """
-    Specifically fetches Hyperliquid meta data (funding rates, open interest)
-    and saves it to the MarketContext JSON memory bank.
-    """
-    url = "https://api.hyperliquid.xyz/info"
-    payload = {"type": "metaAndAssetCtxs"}
-    
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, json=payload, timeout=10.0)
-            response.raise_for_status()
-            data = response.json()
-            
-            # Hyperliquid returns two lists:
-            # data[0]['universe'] contains the coin names (BTC, ETH, etc.)
-            # data[1] contains the actual metrics (funding, open interest)
-            
-            universe = data[0].get("universe", [])
-            contexts = data[1]
-            
-            if len(universe) != len(contexts):
-                print("⚠️ Hyperliquid data length mismatch.")
+            if not isinstance(data, list) or len(data) < 2:
                 return
 
-            print(f"🔄 Ingesting DEX Data for {len(universe)} coins...")
-            
-            for i, coin_info in enumerate(universe):
-                coin_name = coin_info.get("name")
-                metrics = contexts[i]
-                
-                # Format the payload for our AI memory bank
-                ai_payload = {
-                    "source": "Hyperliquid DEX",
-                    "funding_rate": metrics.get("funding"),
-                    "open_interest": metrics.get("openInterest"),
-                    "predicted_funding": metrics.get("predictedFunding"),
-                    "mark_price": metrics.get("markPx")
-                }
-                
-                # Check if we already have context for this coin
-                result = await db.execute(
-                    select(MarketContext).where(
-                        MarketContext.coin == coin_name,
-                        MarketContext.data_type == "DEX_Metrics"
-                    )
-                )
-                existing_context = result.scalar_one_or_none()
-                
-                if existing_context:
-                    existing_context.payload = ai_payload
-                    existing_context.updated_at = datetime.utcnow()
-                else:
-                    new_context = MarketContext(
-                        coin=coin_name,
-                        data_type="DEX_Metrics",
-                        payload=ai_payload
-                    )
-                    db.add(new_context)
-                    
-            await db.commit()
-            print("✅ Hyperliquid DEX Data mapped to memory.")
-            
-    except Exception as e:
-        print(f"❌ Failed to ingest Hyperliquid data: {e}")
+            universe = data[0].get("universe", [])
+            asset_ctxs = data[1]
 
-async def run_worker():
-    """The main loop that runs forever in the background."""
-    print("🤖 API Worker started. Ingesting market context...")
+            for idx, asset_info in enumerate(universe):
+                coin = asset_info.get("name")
+                if not coin or idx >= len(asset_ctxs):
+                    continue
+
+                ctx = asset_ctxs[idx]
+                
+                # Format the DEX data payload
+                dex_payload = {
+                    "source": "Hyperliquid DEX",
+                    "funding_rate": ctx.get("funding"),
+                    "open_interest": ctx.get("openInterest"),
+                    "predicted_funding": ctx.get("predictedFunding"),
+                    "mark_price": ctx.get("markPx")
+                }
+
+                # Upsert into MarketContext table
+                stmt = select(MarketContext).where(
+                    MarketContext.coin == coin,
+                    MarketContext.data_type == "DEX_Metrics"
+                )
+                result = await db.execute(stmt)
+                context = result.scalar_one_or_none()
+
+                if context:
+                    context.payload = dex_payload
+                    context.last_updated = datetime.now(timezone.utc)
+                else:
+                    context = MarketContext(
+                        coin=coin,
+                        data_type="DEX_Metrics",
+                        payload=dex_payload
+                    )
+                    db.add(context)
+            
+            await db.commit()
+            bot_state.log("🔄 Hyperliquid DEX Data mapped to memory.")
+
+    except Exception as e:
+        bot_state.log(f"⚠️ Failed to ingest Hyperliquid Data: {e}", level="warning")
+
+
+async def ingest_fear_and_greed(db: AsyncSession, session: aiohttp.ClientSession):
+    """Fetches the global crypto Fear & Greed Index (0-100)."""
+    try:
+        async with session.get("https://api.alternative.me/fng/?limit=1") as resp:
+            data = await resp.json()
+            if not data or 'data' not in data: return
+            
+            fgi_data = data['data'][0]
+            payload = {
+                "source": "Alternative.me FGI",
+                "value": int(fgi_data['value']),
+                "classification": fgi_data['value_classification']
+            }
+
+            stmt = select(MarketContext).where(
+                MarketContext.coin == "GLOBAL",
+                MarketContext.data_type == "Fear_And_Greed"
+            )
+            result = await db.execute(stmt)
+            context = result.scalar_one_or_none()
+
+            if context:
+                context.payload = payload
+                context.last_updated = datetime.now(timezone.utc)
+            else:
+                context = MarketContext(
+                    coin="GLOBAL",
+                    data_type="Fear_And_Greed",
+                    payload=payload
+                )
+                db.add(context)
+            await db.commit()
+            bot_state.log(f"🧠 Macro Sentiment Updated: {payload['classification']} ({payload['value']}/100)")
+    except Exception as e:
+        bot_state.log(f"⚠️ Failed to ingest Fear & Greed: {e}", level="warning")
+
+
+async def ingest_binance_ls_ratio(db: AsyncSession, session: aiohttp.ClientSession):
+    """Fetches what the top 20% most profitable Binance accounts are doing with BTC."""
+    symbol = "BTCUSDT"
+    try:
+        url = f"https://fapi.binance.com/futures/data/topLongShortAccountRatio?symbol={symbol}&period=5m"
+        async with session.get(url) as resp:
+            data = await resp.json()
+            if not data or len(data) == 0: return
+
+            latest = data[-1]
+            payload = {
+                "source": "Binance Top Traders (Whales)",
+                "long_ratio_pct": float(latest['longAccount']) * 100,
+                "short_ratio_pct": float(latest['shortAccount']) * 100,
+                "long_short_ratio": float(latest['longShortRatio'])
+            }
+
+            stmt = select(MarketContext).where(
+                MarketContext.coin == "BTC",
+                MarketContext.data_type == "Whale_L_S_Ratio"
+            )
+            result = await db.execute(stmt)
+            context = result.scalar_one_or_none()
+
+            if context:
+                context.payload = payload
+                context.last_updated = datetime.now(timezone.utc)
+            else:
+                context = MarketContext(
+                    coin="BTC",
+                    data_type="Whale_L_S_Ratio",
+                    payload=payload
+                )
+                db.add(context)
+            await db.commit()
+            bot_state.log(f"🐋 Whale Positioning Updated: {payload['long_ratio_pct']:.1f}% LONG on BTC.")
+    except Exception as e:
+        bot_state.log(f"⚠️ Failed to ingest Whale Ratio: {e}", level="warning")
+
+
+async def run_api_worker_loop():
+    """Main background loop that runs every 5 minutes."""
+    bot_state.log("📡 Starting Data Ingestion Worker...")
     
     while True:
         try:
             async with AsyncSessionLocal() as db:
-                # 1. Fetch data from any custom URLs added via the React UI
-                result = await db.execute(select(ApiSource).where(ApiSource.is_active == True))
-                active_sources = result.scalars().all()
-                
-                async with httpx.AsyncClient() as client:
-                    for source in active_sources:
-                        data = await fetch_api_data(client, source.endpoint_url)
-                        if data:
-                            # Save custom API data (like the CoinGecko ping)
-                            context = MarketContext(
-                                coin=None, # Macro data
-                                data_type=f"Custom_API_{source.name}",
-                                payload=data
-                            )
-                            db.add(context)
-                            print(f"✅ Ingested custom API: {source.name}")
-                
-                await db.commit()
-                
-                # 2. Hardcoded High-Value Ingestion (Hyperliquid)
-                await ingest_hyperliquid_meta(db)
-                
+                async with aiohttp.ClientSession() as session:
+                    # Run all three data ingestion tasks concurrently
+                    await asyncio.gather(
+                        ingest_hyperliquid_meta(db, session),
+                        ingest_fear_and_greed(db, session),
+                        ingest_binance_ls_ratio(db, session)
+                    )
         except Exception as e:
-             print(f"❌ API Worker Critical Error: {e}")
-             
-        # Sleep for 5 minutes before fetching again
-        print("💤 API Worker sleeping for 5 minutes...")
+            bot_state.log(f"⚠️ API Worker Loop Error: {e}", level="error")
+            
+        # Sleep for 5 minutes before fetching fresh data
         await asyncio.sleep(300)
 
 if __name__ == "__main__":
-    asyncio.run(run_worker())
+    # For standalone testing of the worker
+    asyncio.run(run_api_worker_loop())
