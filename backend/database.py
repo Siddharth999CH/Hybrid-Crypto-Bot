@@ -15,6 +15,7 @@ class TradeDirection(str, enum.Enum):
     SHORT = "SHORT"
 
 class TradeStatus(str, enum.Enum):
+    NEW = "NEW"
     PENDING_APPROVAL = "PENDING_APPROVAL"
     APPROVED = "APPROVED"
     REJECTED = "REJECTED"
