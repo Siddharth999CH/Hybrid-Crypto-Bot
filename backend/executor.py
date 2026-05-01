@@ -1,12 +1,14 @@
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional
+from functools import partial
 from config import settings
 from state import bot_state
 from database import Trade, TradeStatus
 
 
 def get_exchange():
+    """Returns a synchronous ccxt Binance instance."""
     import ccxt
     exchange = ccxt.binance({
         'apiKey': settings.BINANCE_API_KEY,
@@ -19,12 +21,20 @@ def get_exchange():
     return exchange
 
 
+async def _run_sync(fn, *args, **kwargs):
+    """
+    FIX 2: Run any blocking ccxt call in a thread pool so the FastAPI
+    event loop is never frozen. All ccxt calls in this file go through here.
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, partial(fn, *args, **kwargs))
+
+
 async def get_current_price(coin: str) -> Optional[float]:
-    """Fetch current market price from Binance."""
+    """Fetch current market price from Binance (non-blocking)."""
     try:
         exchange = get_exchange()
-        symbol = f"{coin}/USDT"
-        ticker = exchange.fetch_ticker(symbol)
+        ticker = await _run_sync(exchange.fetch_ticker, f"{coin}/USDT")
         return float(ticker['last'])
     except Exception as e:
         bot_state.log(f"⚠️ Price fetch failed for {coin}: {str(e)[:50]}", level="warning")
@@ -61,7 +71,7 @@ class PaperTradeExecutor:
 
             bot_state.open_trades_count += 1
             bot_state.log(
-                f"📝 PAPER {signal['direction']} {signal['coin']} @ ${current_price:,.2f} "
+                f"📝 PAPER {signal['direction']} {signal['coin']} @ ${current_price:,.4f} "
                 f"| Size: ${trade.position_size_usdt:.0f}",
                 level="info"
             )
@@ -112,7 +122,7 @@ class PaperTradeExecutor:
 
 
 class LiveTradeExecutor:
-    """Executes real orders on Binance via ccxt."""
+    """Executes real orders on Binance via ccxt (all calls non-blocking)."""
 
     async def execute(self, trade: Trade, signal: dict) -> bool:
         try:
@@ -120,47 +130,55 @@ class LiveTradeExecutor:
             symbol = f"{signal['coin']}/USDT"
             side = "buy" if signal['direction'] == "LONG" else "sell"
 
-            # Set leverage for futures
+            # Set leverage for futures (non-blocking)
             if signal.get('market_type') == 'futures' and signal.get('leverage'):
                 try:
-                    exchange.set_leverage(signal['leverage'], symbol)
-                except:
+                    await _run_sync(exchange.set_leverage, signal['leverage'], symbol)
+                except Exception:
                     pass
 
-            exchange.load_markets()
-            current_price = exchange.fetch_ticker(symbol)['last']
-            amount = float(exchange.amount_to_precision(
-                symbol, trade.position_size_usdt / current_price
-            ))
+            await _run_sync(exchange.load_markets)
+            ticker = await _run_sync(exchange.fetch_ticker, symbol)
+            current_price = ticker['last']
 
-            order = exchange.create_market_order(symbol, side, amount)
+            raw_amount = trade.position_size_usdt / current_price
+            amount = float(exchange.amount_to_precision(symbol, raw_amount))
+
+            order = await _run_sync(exchange.create_market_order, symbol, side, amount)
+
             trade.entry_price = current_price
             trade.status = TradeStatus.OPEN
             trade.opened_at = datetime.utcnow()
             trade.is_paper = False
             bot_state.open_trades_count += 1
 
-            # Place TP bracket orders
+            # Place TP bracket order (non-blocking)
             exit_side = "sell" if side == "buy" else "buy"
             if signal.get('tp1'):
                 try:
-                    exchange.create_order(symbol, 'TAKE_PROFIT_MARKET', exit_side, amount,
-                                          {'stopPrice': signal['tp1'], 'reduceOnly': True})
+                    await _run_sync(
+                        exchange.create_order, symbol, 'TAKE_PROFIT_MARKET',
+                        exit_side, amount,
+                        {'stopPrice': signal['tp1'], 'reduceOnly': True}
+                    )
                     bot_state.log(f"🎯 TP1 bracket set @ ${signal['tp1']}")
                 except Exception as e:
                     bot_state.log(f"⚠️ TP1 order failed: {str(e)[:40]}", level="warning")
 
-            # Place SL bracket order
+            # Place SL bracket order (non-blocking)
             if signal.get('stop_loss'):
                 try:
-                    exchange.create_order(symbol, 'STOP_MARKET', exit_side, amount,
-                                          {'stopPrice': signal['stop_loss'], 'reduceOnly': True})
+                    await _run_sync(
+                        exchange.create_order, symbol, 'STOP_MARKET',
+                        exit_side, amount,
+                        {'stopPrice': signal['stop_loss'], 'reduceOnly': True}
+                    )
                     bot_state.log(f"🛡️ SL bracket set @ ${signal['stop_loss']}")
                 except Exception as e:
                     bot_state.log(f"⚠️ SL order failed: {str(e)[:40]}", level="warning")
 
             bot_state.log(
-                f"⚡ LIVE {signal['direction']} {signal['coin']} @ ${current_price:,.2f} | "
+                f"⚡ LIVE {signal['direction']} {signal['coin']} @ ${current_price:,.4f} | "
                 f"Order: {order['id']}",
                 level="success"
             )
@@ -168,7 +186,8 @@ class LiveTradeExecutor:
                 "coin": signal['coin'],
                 "direction": signal['direction'],
                 "entry": current_price,
-                "is_paper": False
+                "is_paper": False,
+                "trade_id": trade.id
             })
             return True
 
@@ -184,21 +203,17 @@ async def execute_trade(trade: Trade, signal: dict) -> bool:
         bot_state.log(f"🚫 Trade blocked: {reason}", level="warning")
         return False
 
-    # Slippage check
+    # Slippage check (only when entry price is known)
     if signal.get('entry_price'):
         within, current = await check_slippage(signal['coin'], signal['entry_price'])
         if not within:
             bot_state.log(
                 f"⏭️ SKIPPED: {signal['coin']} price moved too far "
-                f"(signal: ${signal['entry_price']:,.0f}, now: ${current:,.0f})",
+                f"(signal: ${signal['entry_price']:,.2f}, now: ${current:,.2f})",
                 level="warning"
             )
             trade.status = TradeStatus.SKIPPED_SLIPPAGE
             return False
 
-    if bot_state.paper_mode:
-        executor = PaperTradeExecutor()
-    else:
-        executor = LiveTradeExecutor()
-
+    executor = PaperTradeExecutor() if bot_state.paper_mode else LiveTradeExecutor()
     return await executor.execute(trade, signal)
