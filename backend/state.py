@@ -1,9 +1,20 @@
 import asyncio
+import os
 from datetime import datetime, date
 from typing import List, Dict, Optional, Set
 import json
 import sys
 from config import settings
+
+# FIX 3: Use a relative path or env-variable driven path — never a hardcoded
+# Windows absolute path.  Falls back to a no-op if the log file can't be opened
+# (e.g. on Render/Railway where the desktop doesn't exist).
+_DEBUG_LOG_PATH: Optional[str] = os.environ.get(
+    "DEBUG_LOG_PATH",
+    os.path.join(os.path.dirname(__file__), "debug.log")
+)
+_DEBUG_ENABLED: bool = os.environ.get("ENABLE_DEBUG_LOG", "false").lower() == "true"
+
 
 class BotState:
     """Central shared state for the entire bot system."""
@@ -18,7 +29,7 @@ class BotState:
         self.daily_pnl: float = 0.0
         self.daily_pnl_date: str = str(date.today())
         self.open_trades_count: int = 0
-        self.portfolio_balance: float = 10000.0  # Updated from exchange on startup
+        self.portfolio_balance: float = 10000.0
 
         # Pending approvals: signal_id -> Signal dict
         self.pending_approvals: Dict[int, dict] = {}
@@ -43,17 +54,21 @@ class BotState:
         self.trailing_sl: bool = False
         self.signal_notifications: bool = True
 
-        # ─────────────────────────────────────────
-        # PHASE A: SENTIMENT RADAR VARIABLES
-        # ─────────────────────────────────────────
-        self.trading_style: str = "scalp" 
-        self.radar_bucket: Dict[str, dict] = {} 
+        # Phase A: Sentiment Radar
+        self.trading_style: str = "scalp"
+        self.radar_bucket: Dict[str, dict] = {}
         self.active_trades_coins: Set[str] = set()
-    
+
     def debug_log(self, run_id: str, hypothesis_id: str, location: str, message: str, data: dict):
+        """
+        FIX 3: Write debug telemetry only when ENABLE_DEBUG_LOG=true.
+        Uses a relative path so it works on any machine, not just the dev's Windows box.
+        """
+        if not _DEBUG_ENABLED:
+            return
         try:
             payload = {
-                "sessionId": "e3292d",
+                "sessionId": run_id,
                 "runId": run_id,
                 "hypothesisId": hypothesis_id,
                 "location": location,
@@ -61,10 +76,10 @@ class BotState:
                 "data": data,
                 "timestamp": int(datetime.now().timestamp() * 1000),
             }
-            with open("C:/Users/91990/Desktop/Hybrid-Crypto-Bot/debug-e3292d.log", "a", encoding="utf-8") as f:
+            with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
                 f.write(json.dumps(payload, ensure_ascii=True) + "\n")
         except Exception:
-            pass
+            pass  # Debug logging must never crash the application
 
     def log(self, message: str, level: str = "info"):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -76,19 +91,9 @@ class BotState:
         try:
             print(line)
         except UnicodeEncodeError:
-            # Windows cp1252 consoles can choke on emoji; degrade gracefully.
-            encoding = (getattr(sys.stdout, "encoding", None) or "utf-8")
-            safe_line = line.encode(encoding, errors="replace").decode(encoding, errors="replace")
-            print(safe_line)
-        # #region agent log
-        self.debug_log(
-            run_id="initial",
-            hypothesis_id="H1",
-            location="backend/state.py:log",
-            message="bot_state.log emitted",
-            data={"level": level, "message": message[:200]},
-        )
-        # #endregion
+            encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+            safe = line.encode(encoding, errors="replace").decode(encoding, errors="replace")
+            print(safe)
 
     def check_and_reset_daily_pnl(self):
         today = str(date.today())
@@ -96,7 +101,6 @@ class BotState:
             self.daily_pnl = 0.0
             self.daily_pnl_date = today
             if self.kill_switch_active and "drawdown" in self.kill_switch_reason.lower():
-                # Auto-reset kill switch on new day
                 self.kill_switch_active = False
                 self.kill_switch_reason = ""
                 self.log("🔄 Kill switch auto-reset for new trading day.")
@@ -108,29 +112,10 @@ class BotState:
         self.log(f"🚨 KILL SWITCH TRIGGERED: {reason}", level="danger")
 
     def can_trade(self, coin: str) -> tuple[bool, str]:
-        """Returns (can_trade, reason_if_not)"""
         self.check_and_reset_daily_pnl()
         if self.kill_switch_active:
-            # #region agent log
-            self.debug_log(
-                run_id="initial",
-                hypothesis_id="H4",
-                location="backend/state.py:can_trade",
-                message="can_trade blocked by kill switch",
-                data={"coin": coin, "reason": self.kill_switch_reason},
-            )
-            # #endregion
             return False, f"Kill switch active: {self.kill_switch_reason}"
         if not self.is_active:
-            # #region agent log
-            self.debug_log(
-                run_id="initial",
-                hypothesis_id="H4",
-                location="backend/state.py:can_trade",
-                message="can_trade blocked by paused bot",
-                data={"coin": coin, "is_active": self.is_active},
-            )
-            # #endregion
             return False, "Bot is paused"
         if self.open_trades_count >= self.max_concurrent_trades:
             return False, f"Max concurrent trades ({self.max_concurrent_trades}) reached"
@@ -138,29 +123,8 @@ class BotState:
             if datetime.now() < self.sl_cooldowns[coin.upper()]:
                 remaining = (self.sl_cooldowns[coin.upper()] - datetime.now()).seconds // 60
                 return False, f"{coin} in SL cooldown ({remaining}m remaining)"
-        
-        # Phase A Check: Prevent opening multiple positions on the same coin
         if coin.upper() in self.active_trades_coins:
-             # #region agent log
-             self.debug_log(
-                 run_id="initial",
-                 hypothesis_id="H4",
-                 location="backend/state.py:can_trade",
-                 message="can_trade blocked by active coin lock",
-                 data={"coin": coin},
-             )
-             # #endregion
-             return False, f"Trade already active for {coin}"
-             
-        # #region agent log
-        self.debug_log(
-            run_id="initial",
-            hypothesis_id="H4",
-            location="backend/state.py:can_trade",
-            message="can_trade allowed",
-            data={"coin": coin, "open_trades_count": self.open_trades_count},
-        )
-        # #endregion
+            return False, f"Trade already active for {coin}"
         return True, ""
 
     def add_pnl(self, pnl_usdt: float):
@@ -174,7 +138,6 @@ class BotState:
 
     async def broadcast(self, event_type: str, data: dict):
         """Push event to all connected WebSocket clients."""
-        import json
         message = json.dumps({"type": event_type, "data": data})
         dead = []
         for ws in self.ws_clients:
@@ -184,6 +147,7 @@ class BotState:
                 dead.append(ws)
         for ws in dead:
             self.ws_clients.remove(ws)
+
 
 # Singleton
 bot_state = BotState()
