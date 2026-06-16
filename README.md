@@ -18,22 +18,3 @@ Hybrid-Crypto-Bot intercepts Telegram trading signals, enriches them with live D
 🛠️ Tech Stack
 Backend: Python, FastAPI, SQLAlchemy, CCXT, Telethon, LiteLLM | Frontend: React, Vite | DB: SQLite
 
-🚀 Quick Start
-1. Backend
-Bash
-git clone https://github.com/yourusername/Hybrid-Crypto-Bot.git
-cd Hybrid-Crypto-Bot/backend
-python -m venv bot_env
-source bot_env/bin/activate  # Windows: bot_env\Scripts\activate
-pip install -r requirements.txt
-python main.py
-2. Frontend
-Bash
-cd ../frontend
-npm install
-npm run dev
-3. Configure
-Open http://localhost:5173, navigate to Settings, and plug in your LLM Provider, Binance Keys, and Telegram API credentials.
-
-⚠️ Disclaimer
-Educational purposes only. Do not risk money you cannot afford to lose. Always run in PAPER_MODE first. Use at your own risk.
